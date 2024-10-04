@@ -4,8 +4,10 @@ use std::mem;
 use thiserror::Error;
 use tracing::debug;
 
-use super::{Retransmits, ShouldTransmit, StreamHalf, StreamId, StreamsState, UnknownStream};
+use super::state::get_or_insert_recv;
+use super::{Retransmits, ShouldTransmit, StreamId, StreamsState, UnknownStream};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
+use crate::connection::streams::state::StreamRecv;
 use crate::{frame, TransportError, VarInt};
 
 #[derive(Debug, Default)]
@@ -26,6 +28,15 @@ impl Recv {
             end: 0,
             stopped: false,
         }
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self, initial_max_data: u64) {
+        self.state = RecvState::default();
+        self.assembler.reinit();
+        self.sent_max_stream_data = initial_max_data;
+        self.end = 0;
+        self.stopped = false;
     }
 
     /// Process a STREAM frame
@@ -215,15 +226,16 @@ impl<'a> Chunks<'a> {
         streams: &'a mut StreamsState,
         pending: &'a mut Retransmits,
     ) -> Result<Self, ReadableError> {
-        let entry = match streams.recv.entry(id) {
+        let mut entry = match streams.recv.entry(id) {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(_) => return Err(ReadableError::UnknownStream),
         };
 
-        let mut recv = match entry.get().stopped {
-            true => return Err(ReadableError::UnknownStream),
-            false => entry.remove(),
-        };
+        let mut recv =
+            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
+                true => return Err(ReadableError::UnknownStream),
+                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+            };
 
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
@@ -231,7 +243,7 @@ impl<'a> Chunks<'a> {
             ordered,
             streams,
             pending,
-            state: ChunksState::Readable(recv),
+            state: ChunksState::Readable(*recv),
             read: 0,
         })
     }
@@ -259,14 +271,24 @@ impl<'a> Chunks<'a> {
         match rs.state {
             RecvState::ResetRecvd { error_code, .. } => {
                 debug_assert_eq!(self.read, 0, "reset streams have empty buffers");
-                self.streams.stream_freed(self.id, StreamHalf::Recv);
-                self.state = ChunksState::Reset(error_code);
+                let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
+                // At this point if we have `rs` self.state must be `ChunksState::Readable`
+                let recv = match state {
+                    ChunksState::Readable(recv) => StreamRecv::Open(Box::new(recv)),
+                    _ => unreachable!("state must be ChunkState::Readable"),
+                };
+                self.streams.stream_recv_freed(self.id, recv);
                 Err(ReadError::Reset(error_code))
             }
             RecvState::Recv { size } => {
                 if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
-                    self.streams.stream_freed(self.id, StreamHalf::Recv);
-                    self.state = ChunksState::Finished;
+                    let state = mem::replace(&mut self.state, ChunksState::Finished);
+                    // At this point if we have `rs` self.state must be `ChunksState::Readable`
+                    let recv = match state {
+                        ChunksState::Readable(recv) => StreamRecv::Open(Box::new(recv)),
+                        _ => unreachable!("state must be ChunkState::Readable"),
+                    };
+                    self.streams.stream_recv_freed(self.id, recv);
                     Ok(None)
                 } else {
                     // We don't need a distinct `ChunksState` variant for a blocked stream because
@@ -313,7 +335,9 @@ impl<'a> Chunks<'a> {
                 self.pending.max_stream_data.insert(self.id);
             }
             // Return the stream to storage for future use
-            self.streams.recv.insert(self.id, rs);
+            self.streams
+                .recv
+                .insert(self.id, Some(StreamRecv::Open(Box::new(rs))));
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state

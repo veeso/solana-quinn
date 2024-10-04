@@ -4,6 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use state::get_or_insert_recv;
 use thiserror::Error;
 use tracing::trace;
 
@@ -133,7 +134,7 @@ impl<'a> RecvStream<'a> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(UnknownStream { _private: () }),
         };
-        let stream = entry.get_mut();
+        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
@@ -147,8 +148,8 @@ impl<'a> RecvStream<'a> {
         // connection-level flow control to account for discarded data. Otherwise, we can discard
         // state immediately.
         if !stream.receiving_unknown_size() {
-            entry.remove();
-            self.state.stream_freed(self.id, StreamHalf::Recv);
+            let recv = entry.remove().expect("must have recv when stopping");
+            self.state.stream_recv_freed(self.id, recv);
         }
 
         if self.state.add_read_credits(read_credits).should_transmit() {
