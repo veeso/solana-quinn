@@ -31,6 +31,7 @@ pub struct TransportConfig {
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) send_fairness: bool,
 
     pub(crate) max_tlps: u32,
     pub(crate) packet_threshold: u32,
@@ -133,6 +134,21 @@ impl TransportConfig {
     /// Maximum number of tail loss probes before an RTO fires.
     pub fn max_tlps(&mut self, value: u32) -> &mut Self {
         self.max_tlps = value;
+        self
+    }
+
+    /// Whether to implement fair queuing for send streams having the same priority.
+    ///
+    /// When enabled, connections schedule data from outgoing streams having the same priority in a
+    /// round-robin fashion. When disabled, streams are scheduled in the order they are written to.
+    ///
+    /// Note that this only affects streams with the same priority. Higher priority streams always
+    /// take precedence over lower priority streams.
+    ///
+    /// Disabling fairness can reduce fragmentation and protocol overhead for workloads that use
+    /// many small streams.
+    pub fn send_fairness(&mut self, value: bool) -> &mut Self {
+        self.send_fairness = value;
         self
     }
 
@@ -308,6 +324,7 @@ impl Default for TransportConfig {
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
+            send_fairness: true,
 
             max_tlps: 2,
             packet_threshold: 3,
@@ -344,6 +361,7 @@ impl fmt::Debug for TransportConfig {
             .field("stream_receive_window", &self.stream_receive_window)
             .field("receive_window", &self.receive_window)
             .field("send_window", &self.send_window)
+            .field("send_fairness", &self.send_fairness)
             .field("max_tlps", &self.max_tlps)
             .field("packet_threshold", &self.packet_threshold)
             .field("time_threshold", &self.time_threshold)
